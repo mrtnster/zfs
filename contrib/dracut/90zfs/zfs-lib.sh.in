@@ -62,6 +62,18 @@ for_relevant_root_children() {
             done
             exit "${_ret}"
         )
+
+    # If ZFSBootMenu is in use and there is a keysource dataset then mount it
+    pool="${dataset%%/*}"
+    keysource="$(zfs get -Ho value org.zfsbootmenu:keysource "${pool}")"
+
+    if ! [ "${keysource}" = "-" ]; then
+        canmount="$(zfs get -Ho value canmount "${keysource}")"
+        if [ "${canmount}" = "on" ]; then
+            mountpoint="$(zfs get -Ho value mountpoint "${keysource}")"
+            "${exec}" "${keysource}" "${mountpoint}"
+        fi
+    fi
 }
 
 # Parse root=, rootfstype=, return them decoded and normalised to zfs:AUTO for auto, plain dset for explicit
