@@ -4272,13 +4272,17 @@ print_iostat_header(iostat_cbdata_t *cb)
  * by order of magnitude. Uses column_size to add padding.
  */
 static void
-print_stat_color(char *statbuf, unsigned int column_size)
+print_stat_color(const char *statbuf, unsigned int column_size)
 {
 	fputs("  ", stdout);
+	size_t len = strlen(statbuf);
+	while (len < column_size) {
+		fputc(' ', stdout);
+		column_size--;
+	}
 	if (*statbuf == '0') {
 		color_start(ANSI_GRAY);
 		fputc('0', stdout);
-		column_size--;
 	} else {
 		for (; *statbuf; statbuf++) {
 			if (*statbuf == 'K') color_start(ANSI_GREEN);
@@ -4293,8 +4297,6 @@ print_stat_color(char *statbuf, unsigned int column_size)
 		}
 	}
 	color_end();
-	for (; column_size > 0; column_size--)
-		fputc(' ', stdout);
 }
 
 /*
@@ -6936,6 +6938,17 @@ zpool_do_online(int argc, char **argv)
 		return (1);
 
 	for (i = 1; i < argc; i++) {
+		vdev_state_t oldstate;
+		boolean_t avail_spare, l2cache;
+		nvlist_t *tgt = zpool_find_vdev(zhp, argv[i], &avail_spare,
+		    &l2cache, NULL);
+		if (tgt == NULL) {
+			ret = 1;
+			continue;
+		}
+		uint_t vsc;
+		oldstate = ((vdev_stat_t *)fnvlist_lookup_uint64_array(tgt,
+		    ZPOOL_CONFIG_VDEV_STATS, &vsc))->vs_state;
 		if (zpool_vdev_online(zhp, argv[i], flags, &newstate) == 0) {
 			if (newstate != VDEV_STATE_HEALTHY) {
 				(void) printf(gettext("warning: device '%s' "
@@ -6949,6 +6962,17 @@ zpool_do_online(int argc, char **argv)
 					(void) printf(gettext("use 'zpool "
 					    "replace' to replace devices "
 					    "that are no longer present\n"));
+				if ((flags & ZFS_ONLINE_EXPAND)) {
+					(void) printf(gettext("%s: failed "
+					    "to expand usable space on "
+					    "unhealthy device '%s'\n"),
+					    (oldstate >= VDEV_STATE_DEGRADED ?
+					    "error" : "warning"), argv[i]);
+					if (oldstate >= VDEV_STATE_DEGRADED) {
+						ret = 1;
+						break;
+					}
+				}
 			}
 		} else {
 			ret = 1;
@@ -8833,7 +8857,7 @@ check_unsupp_fs(zfs_handle_t *zhp, void *unsupp_fs)
 		(*count)++;
 	}
 
-	zfs_iter_filesystems(zhp, 0, check_unsupp_fs, unsupp_fs);
+	zfs_iter_filesystems_v2(zhp, 0, check_unsupp_fs, unsupp_fs);
 
 	zfs_close(zhp);
 
