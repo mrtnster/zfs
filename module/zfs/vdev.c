@@ -29,7 +29,7 @@
  * Copyright (c) 2017, Intel Corporation.
  * Copyright (c) 2019, Datto Inc. All rights reserved.
  * Copyright (c) 2021, Klara Inc.
- * Copyright [2021] Hewlett Packard Enterprise Development LP
+ * Copyright (c) 2021, 2023 Hewlett Packard Enterprise Development LP.
  */
 
 #include <sys/zfs_context.h>
@@ -397,7 +397,9 @@ vdev_prop_get_int(vdev_t *vd, vdev_prop_t prop, uint64_t *value)
 	uint64_t objid;
 	int err;
 
-	if (vd->vdev_top_zap != 0) {
+	if (vd->vdev_root_zap != 0) {
+		objid = vd->vdev_root_zap;
+	} else if (vd->vdev_top_zap != 0) {
 		objid = vd->vdev_top_zap;
 	} else if (vd->vdev_leaf_zap != 0) {
 		objid = vd->vdev_leaf_zap;
@@ -897,6 +899,14 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	 */
 	(void) nvlist_lookup_uint64(nv, ZPOOL_CONFIG_CREATE_TXG,
 	    &vd->vdev_crtxg);
+
+	if (vd->vdev_ops == &vdev_root_ops &&
+	    (alloctype == VDEV_ALLOC_LOAD ||
+	    alloctype == VDEV_ALLOC_SPLIT ||
+	    alloctype == VDEV_ALLOC_ROOTPOOL)) {
+		(void) nvlist_lookup_uint64(nv, ZPOOL_CONFIG_VDEV_ROOT_ZAP,
+		    &vd->vdev_root_zap);
+	}
 
 	/*
 	 * If we're a top-level vdev, try to load the allocation parameters.
@@ -2690,6 +2700,17 @@ vdev_reopen(vdev_t *vd)
 	}
 
 	/*
+	 * Recheck if resilver is still needed and cancel any
+	 * scheduled resilver if resilver is unneeded.
+	 */
+	if (!vdev_resilver_needed(spa->spa_root_vdev, NULL, NULL) &&
+	    spa->spa_async_tasks & SPA_ASYNC_RESILVER) {
+		mutex_enter(&spa->spa_async_lock);
+		spa->spa_async_tasks &= ~SPA_ASYNC_RESILVER;
+		mutex_exit(&spa->spa_async_lock);
+	}
+
+	/*
 	 * Reassess parent vdev's health.
 	 */
 	vdev_propagate_state(vd);
@@ -3346,6 +3367,12 @@ vdev_construct_zaps(vdev_t *vd, dmu_tx_t *tx)
 			if (vd->vdev_alloc_bias != VDEV_BIAS_NONE)
 				vdev_zap_allocation_data(vd, tx);
 		}
+	}
+	if (vd->vdev_ops == &vdev_root_ops && vd->vdev_root_zap == 0 &&
+	    spa_feature_is_enabled(vd->vdev_spa, SPA_FEATURE_AVZ_V2)) {
+		if (!spa_feature_is_active(vd->vdev_spa, SPA_FEATURE_AVZ_V2))
+			spa_feature_incr(vd->vdev_spa, SPA_FEATURE_AVZ_V2, tx);
+		vd->vdev_root_zap = vdev_create_link_zap(vd, tx);
 	}
 
 	for (uint64_t i = 0; i < vd->vdev_children; i++) {
@@ -4081,10 +4108,17 @@ vdev_remove_wanted(spa_t *spa, uint64_t guid)
 		return (spa_vdev_state_exit(spa, NULL, SET_ERROR(ENODEV)));
 
 	/*
-	 * If the vdev is already removed, then don't do anything.
+	 * If the vdev is already removed, or expanding which can trigger
+	 * repartition add/remove events, then don't do anything.
 	 */
-	if (vd->vdev_removed)
+	if (vd->vdev_removed || vd->vdev_expanding)
 		return (spa_vdev_state_exit(spa, NULL, 0));
+
+	/*
+	 * Confirm the vdev has been removed, otherwise don't do anything.
+	 */
+	if (vd->vdev_ops->vdev_op_leaf && !zio_wait(vdev_probe(vd, NULL)))
+		return (spa_vdev_state_exit(spa, NULL, SET_ERROR(EEXIST)));
 
 	vd->vdev_remove_wanted = B_TRUE;
 	spa_async_request(spa, SPA_ASYNC_REMOVE);
@@ -4183,9 +4217,19 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 
 	if (wasoffline ||
 	    (oldstate < VDEV_STATE_DEGRADED &&
-	    vd->vdev_state >= VDEV_STATE_DEGRADED))
+	    vd->vdev_state >= VDEV_STATE_DEGRADED)) {
 		spa_event_notify(spa, vd, NULL, ESC_ZFS_VDEV_ONLINE);
 
+		/*
+		 * Asynchronously detach spare vdev if resilver or
+		 * rebuild is not required
+		 */
+		if (vd->vdev_unspare &&
+		    !dsl_scan_resilvering(spa->spa_dsl_pool) &&
+		    !dsl_scan_resilver_scheduled(spa->spa_dsl_pool) &&
+		    !vdev_rebuild_active(tvd))
+			spa_async_request(spa, SPA_ASYNC_DETACH_SPARE);
+	}
 	return (spa_vdev_state_exit(spa, vd, 0));
 }
 
@@ -5673,12 +5717,17 @@ vdev_props_set_sync(void *arg, dmu_tx_t *tx)
 		/*
 		 * Set vdev property values in the vdev props mos object.
 		 */
-		if (vd->vdev_top_zap != 0) {
+		if (vd->vdev_root_zap != 0) {
+			objid = vd->vdev_root_zap;
+		} else if (vd->vdev_top_zap != 0) {
 			objid = vd->vdev_top_zap;
 		} else if (vd->vdev_leaf_zap != 0) {
 			objid = vd->vdev_leaf_zap;
 		} else {
-			panic("vdev not top or leaf");
+			/*
+			 * XXX: implement vdev_props_set_check()
+			 */
+			panic("vdev not root/top/leaf");
 		}
 
 		switch (prop = vdev_name_to_prop(propname)) {
@@ -5881,7 +5930,9 @@ vdev_prop_get(vdev_t *vd, nvlist_t *innvl, nvlist_t *outnvl)
 
 	nvlist_lookup_nvlist(innvl, ZPOOL_VDEV_PROPS_GET_PROPS, &nvprops);
 
-	if (vd->vdev_top_zap != 0) {
+	if (vd->vdev_root_zap != 0) {
+		objid = vd->vdev_root_zap;
+	} else if (vd->vdev_top_zap != 0) {
 		objid = vd->vdev_top_zap;
 	} else if (vd->vdev_leaf_zap != 0) {
 		objid = vd->vdev_leaf_zap;

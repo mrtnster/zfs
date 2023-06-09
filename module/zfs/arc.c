@@ -965,7 +965,7 @@ static void l2arc_hdr_restore(const l2arc_log_ent_phys_t *le,
     l2arc_dev_t *dev);
 
 /* L2ARC persistence write I/O routines. */
-static void l2arc_log_blk_commit(l2arc_dev_t *dev, zio_t *pio,
+static uint64_t l2arc_log_blk_commit(l2arc_dev_t *dev, zio_t *pio,
     l2arc_write_callback_t *cb);
 
 /* L2ARC persistence auxiliary routines. */
@@ -5696,8 +5696,8 @@ top:
 	 * and treat it as a checksum error.  This allows an alternate blkptr
 	 * to be tried when one is available (e.g. ditto blocks).
 	 */
-	if (!zfs_blkptr_verify(spa, bp, zio_flags & ZIO_FLAG_CONFIG_WRITER,
-	    BLK_VERIFY_LOG)) {
+	if (!zfs_blkptr_verify(spa, bp, (zio_flags & ZIO_FLAG_CONFIG_WRITER) ?
+	    BLK_CONFIG_HELD : BLK_CONFIG_NEEDED, BLK_VERIFY_LOG)) {
 		rc = SET_ERROR(ECKSUM);
 		goto done;
 	}
@@ -8175,7 +8175,7 @@ l2arc_write_eligible(uint64_t spa_guid, arc_buf_hdr_t *hdr)
 static uint64_t
 l2arc_write_size(l2arc_dev_t *dev)
 {
-	uint64_t size, dev_size, tsize;
+	uint64_t size;
 
 	/*
 	 * Make sure our globals have meaningful values in case the user
@@ -8192,28 +8192,40 @@ l2arc_write_size(l2arc_dev_t *dev)
 	if (arc_warm == B_FALSE)
 		size += l2arc_write_boost;
 
+	/* We need to add in the worst case scenario of log block overhead. */
+	size += l2arc_log_blk_overhead(size, dev);
+	if (dev->l2ad_vdev->vdev_has_trim && l2arc_trim_ahead > 0) {
+		/*
+		 * Trim ahead of the write size 64MB or (l2arc_trim_ahead/100)
+		 * times the writesize, whichever is greater.
+		 */
+		size += MAX(64 * 1024 * 1024,
+		    (size * l2arc_trim_ahead) / 100);
+	}
+
 	/*
 	 * Make sure the write size does not exceed the size of the cache
 	 * device. This is important in l2arc_evict(), otherwise infinite
 	 * iteration can occur.
 	 */
-	dev_size = dev->l2ad_end - dev->l2ad_start;
-	tsize = size + l2arc_log_blk_overhead(size, dev);
-	if (dev->l2ad_vdev->vdev_has_trim && l2arc_trim_ahead > 0)
-		tsize += MAX(64 * 1024 * 1024,
-		    (tsize * l2arc_trim_ahead) / 100);
-
-	if (tsize >= dev_size) {
+	if (size >= dev->l2ad_end - dev->l2ad_start) {
 		cmn_err(CE_NOTE, "l2arc_write_max or l2arc_write_boost "
 		    "plus the overhead of log blocks (persistent L2ARC, "
 		    "%llu bytes) exceeds the size of the cache device "
 		    "(guid %llu), resetting them to the default (%d)",
 		    (u_longlong_t)l2arc_log_blk_overhead(size, dev),
 		    (u_longlong_t)dev->l2ad_vdev->vdev_guid, L2ARC_WRITE_SIZE);
+
 		size = l2arc_write_max = l2arc_write_boost = L2ARC_WRITE_SIZE;
 
 		if (arc_warm == B_FALSE)
 			size += l2arc_write_boost;
+
+		size += l2arc_log_blk_overhead(size, dev);
+		if (dev->l2ad_vdev->vdev_has_trim && l2arc_trim_ahead > 0) {
+			size += MAX(64 * 1024 * 1024,
+			    (size * l2arc_trim_ahead) / 100);
+		}
 	}
 
 	return (size);
@@ -8836,19 +8848,6 @@ l2arc_evict(l2arc_dev_t *dev, uint64_t distance, boolean_t all)
 
 	buflist = &dev->l2ad_buflist;
 
-	/*
-	 * We need to add in the worst case scenario of log block overhead.
-	 */
-	distance += l2arc_log_blk_overhead(distance, dev);
-	if (vd->vdev_has_trim && l2arc_trim_ahead > 0) {
-		/*
-		 * Trim ahead of the write size 64MB or (l2arc_trim_ahead/100)
-		 * times the write size, whichever is greater.
-		 */
-		distance += MAX(64 * 1024 * 1024,
-		    (distance * l2arc_trim_ahead) / 100);
-	}
-
 top:
 	rerun = B_FALSE;
 	if (dev->l2ad_hand >= (dev->l2ad_end - distance)) {
@@ -9419,8 +9418,14 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz)
 			 * arcstat_l2_{size,asize} kstats are updated
 			 * internally.
 			 */
-			if (l2arc_log_blk_insert(dev, hdr))
-				l2arc_log_blk_commit(dev, pio, cb);
+			if (l2arc_log_blk_insert(dev, hdr)) {
+				/*
+				 * l2ad_hand has been accounted for in
+				 * l2arc_log_blk_commit().
+				 */
+				write_asize +=
+				    l2arc_log_blk_commit(dev, pio, cb);
+			}
 
 			zio_nowait(wzio);
 		}
@@ -10570,7 +10575,7 @@ l2arc_dev_hdr_update(l2arc_dev_t *dev)
  * This function allocates some memory to temporarily hold the serialized
  * buffer to be written. This is then released in l2arc_write_done.
  */
-static void
+static uint64_t
 l2arc_log_blk_commit(l2arc_dev_t *dev, zio_t *pio, l2arc_write_callback_t *cb)
 {
 	l2arc_log_blk_phys_t	*lb = &dev->l2ad_log_blk;
@@ -10681,6 +10686,8 @@ l2arc_log_blk_commit(l2arc_dev_t *dev, zio_t *pio, l2arc_write_callback_t *cb)
 	dev->l2ad_log_ent_idx = 0;
 	dev->l2ad_log_blk_payload_asize = 0;
 	dev->l2ad_log_blk_payload_start = 0;
+
+	return (asize);
 }
 
 /*
